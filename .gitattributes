@@ -1,0 +1,2 @@
+# Preserve exact release bytes, including the hashed pet manifest.
+* -text

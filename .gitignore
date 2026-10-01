@@ -1,0 +1,4 @@
+*.backup-*
+*.stage-*
+.blue-whale-install.json
+dist/

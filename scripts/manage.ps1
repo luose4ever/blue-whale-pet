@@ -1,0 +1,91 @@
+$ErrorActionPreference = 'Stop';
+try {
+    $action = $env:BLUE_WHALE_ACTION;
+    if ($action -notin @('install', 'uninstall')) { throw 'Action must be install or uninstall.' };
+    $root = $env:BLUE_WHALE_HOME;
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = $env:CODEX_HOME };
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = Join-Path $env:USERPROFILE '.codex' };
+    $root = [IO.Path]::GetFullPath($root);
+    $pets = Join-Path $root 'pets';
+    $target = Join-Path $pets 'blue-whale-pet';
+    function Assert-NoLinks([string]$path) {
+        $cursor = $path;
+        while ($cursor) {
+            if (Test-Path -LiteralPath $cursor) {
+                if ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing a symbolic link or junction in the destination path.' };
+            };
+            $parent = Split-Path -Path $cursor -Parent;
+            if ($parent -eq $cursor) { break };
+            $cursor = $parent;
+        };
+    };
+    function Get-Hash([string]$path) {
+        $stream = [IO.File]::OpenRead($path);
+        $algorithm = [Security.Cryptography.SHA256]::Create();
+        try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() } finally { $stream.Dispose(); $algorithm.Dispose() };
+    };
+    function Get-Receipt {
+        try {
+            Assert-NoLinks $target;
+            $items = @(Get-ChildItem -LiteralPath $target -Force);
+            if ($items.Count -ne 3 -or @($items | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) }).Count -ne 0) { return $null };
+            $r = Get-Content -LiteralPath (Join-Path $target '.blue-whale-install.json') -Raw -Encoding UTF8 | ConvertFrom-Json;
+            if ($r.package -ne 'blue-whale-pet' -or $r.version -ne 1) { return $null };
+            foreach ($name in @('pet.json', 'spritesheet.png')) {
+                if ($r.hashes.$name -notmatch '^[0-9a-f]{64}$' -or (Get-Hash (Join-Path $target $name)) -ne $r.hashes.$name) { return $null };
+            };
+            return $r;
+        } catch { return $null };
+    };
+    Assert-NoLinks $target;
+    if (Test-Path -LiteralPath $target -PathType Container) {
+        foreach ($entry in @(Get-ChildItem -LiteralPath $target -Force -Recurse)) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing a symbolic link or junction inside the destination folder.' };
+        };
+    };
+    if ($action -eq 'uninstall') {
+        if (-not (Test-Path -LiteralPath $target)) { Write-Host 'Already uninstalled.'; exit 0 };
+        if (-not (Get-Receipt)) { throw 'Folder is unrecognized or modified. Nothing removed; preserve or remove it manually.' };
+        Remove-Item -LiteralPath $target -Recurse -Force;
+        Write-Host 'Uninstalled. Backups were retained. Refresh Pets in the app.';
+        exit 0;
+    };
+    $packageRoot = [IO.Path]::GetFullPath($env:BLUE_WHALE_PACKAGE);
+    $source = Join-Path $packageRoot 'pet';
+    Assert-NoLinks (Join-Path $packageRoot 'checksums.json');
+    $hashes = Get-Content -LiteralPath (Join-Path $packageRoot 'checksums.json') -Raw -Encoding UTF8 | ConvertFrom-Json;
+    foreach ($name in @('pet.json', 'spritesheet.png')) {
+        Assert-NoLinks (Join-Path $source $name);
+        if ($hashes.$name -notmatch '^[0-9a-f]{64}$' -or (Get-Hash (Join-Path $source $name)) -ne $hashes.$name) { throw 'Package checksum failed. Download a clean release.' };
+    };
+    $manifest = Get-Content -LiteralPath (Join-Path $source 'pet.json') -Raw -Encoding UTF8 | ConvertFrom-Json;
+    if ($manifest.id -ne 'blue-whale-pet' -or $manifest.spriteVersionNumber -ne 2 -or $manifest.spritesheetPath -ne 'spritesheet.png') { throw 'Invalid pet manifest.' };
+    $existing = Get-Receipt;
+    if ($existing -and $existing.hashes.'pet.json' -eq $hashes.'pet.json' -and $existing.hashes.'spritesheet.png' -eq $hashes.'spritesheet.png') {
+        Write-Host 'Already installed. Open Settings > Pets > Refresh, then select the pet.';
+        exit 0;
+    };
+    if ((Test-Path -LiteralPath $target) -and $env:BLUE_WHALE_REPLACE -ne '--replace') { throw 'Destination already exists. Nothing changed. Use --replace to back it up and replace explicitly.' };
+    New-Item -ItemType Directory -Path $pets -Force | Out-Null;
+    Assert-NoLinks $target;
+    $stage = Join-Path $pets ('blue-whale-pet.stage-' + [guid]::NewGuid().ToString('N'));
+    $backup = $null;
+    try {
+        New-Item -ItemType Directory -Path $stage | Out-Null;
+        foreach ($name in @('pet.json', 'spritesheet.png')) { Copy-Item -LiteralPath (Join-Path $source $name) -Destination (Join-Path $stage $name); if ((Get-Hash (Join-Path $stage $name)) -ne $hashes.$name) { throw 'Copy verification failed.' } };
+        @{ package = 'blue-whale-pet'; version = 1; hashes = $hashes } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage '.blue-whale-install.json') -Encoding UTF8;
+        if (Test-Path -LiteralPath $target) {
+            $backup = Join-Path $pets ('blue-whale-pet.backup-' + [DateTime]::Now.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'));
+            Move-Item -LiteralPath $target -Destination $backup;
+            Write-Host ('Backup: ' + $backup);
+        };
+        Move-Item -LiteralPath $stage -Destination $target;
+    } catch {
+        if (Test-Path -LiteralPath $stage) { Assert-NoLinks $stage; Remove-Item -LiteralPath $stage -Recurse -Force };
+        if ($backup -and -not (Test-Path -LiteralPath $target)) { Move-Item -LiteralPath $backup -Destination $target };
+        throw;
+    };
+    Write-Host ('Installed: ' + $target);
+    Write-Host 'Open Settings > Pets > Refresh, then select the pet. Cloud selection is separate.';
+    exit 0;
+} catch { Write-Host ('ERROR: ' + $_.Exception.Message); exit 1 };
